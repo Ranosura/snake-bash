@@ -1,0 +1,189 @@
+#!/bin/bash
+
+# This associative array acts as the game field with each index being an ordered pair.
+declare -A field
+
+# You can alter these constants and variables to your liking.
+# $HEAD constant stores the symbol of head, $BODY, $FOOD, $BORDER store the symbol of their respective object.
+# $XMAX and $YMAX store information about the length and height of the field.
+# $TIME is the constant of the read timeout, essentially, the game's speed is based on it, because the game's loop repeats itself each timeout or keystroke.
+# Nothing really stops a player to smash the control keys to move faster, maybe besides of the CPU performance. (I didn't think about optimizing this.) 
+# $UP, $DOWN, $LEFT, $RIGHT define keys used for the snake's control
+declare -r HEAD="h" BODY="b" FOOD="f" BORDER="#" XMAX="25" YMAX="10" TIME=0.5 UP="w" DOWN="s" LEFT="a" RIGHT="d"
+
+# $score defines the amount of body cells, and the default value is 0.
+# $prevMove defines the default key that would be repeated on the start of the game. The key will change if you moved before and waited for read's timeout.
+# $xcoord and $ycoord define current position of the snake's head. By default it's in the upper-left corner.
+# $foodMax states the maximum number of food cells on the field. It isn't a constant because of conditional decreasing if the field's free area is getting smaller than this variable.
+# $curFood is used to track already spawned food to not make more than $foodMax and to add it if eaten.
+declare score=0 prevMove="d" xcoord=0 ycoord=0 foodMax=10 curFood=0
+
+# $moveQueue array is used to track coordinates of each snake's section to be deleted at index equal to $snakeLength. 
+declare -a moveQueue="$xcoord,$ycoord"
+
+# Initialize field's array.
+for ((x=0; x<=XMAX; x++)); do
+    for ((y=0; y<=YMAX; y++)); do
+        field[$x,$y]=' '
+    done
+done
+
+# Draw field with a nice border.
+clear
+# The top border with score on the right side.
+for ((i=0; i<=(XMAX+2); i++)); do echo -n "$BORDER"; done; echo -en " Score \n"
+# The main body of the function that prints the field.
+for ((y=0; y<=YMAX; y++)); do
+    # Add border's symbol at the start of the line.
+    echo -n "$BORDER"
+    for ((x=0; x<=XMAX; x++)); do
+        echo -n "${field[$x,$y]}"
+    done
+    # Add border's symbol at the end of a line with a newline.
+    echo "$BORDER"
+done
+
+# The bottom border.
+for ((i=0; i<=(XMAX+2); i++)); do echo -n "$BORDER"; done; echo
+
+# Hide cursor from the terminal by applying ANSI sequence.
+echo -ne "\033[?25l"
+
+# Draw-at draws a symbol at the specified coordinates inside borders with the help of ANSI sequences (https://en.wikipedia.org/wiki/ANSI_escape_code). 
+# 2 is added to y and x coordinates, because upper-left corner cell inside borders has coordinates of (0,0), but a terminal is not aware of that.
+# For a terminal (1,1) is the most left and the most upper point, which, in our case, contains border's corner.
+draw-at () {
+    echo -en "\033[$(($1+2));$(($2+2))H"; echo -n "$3"
+}
+
+# Function to properly exit the game.
+clean-exit () {
+    # Shows cursor again
+    echo -ne "\033[?25h"
+    clear 
+    # If first argument is empty, echo quit message; if argument is 0, echo lose message; if argument is 1; echo win message.
+    if [[ -z $1 ]]; then
+        echo "You quit with score $score"
+    elif [[ $1 -eq 0 ]]; then
+        echo "You lost with score $score"
+    elif [[ $1 -eq 1 ]]; then
+        echo "You won with score $score"
+    fi
+    exit 0
+}
+
+# Invokes clean-exit on SIGTERM and SIGINT signals.
+trap clean-exit SIGTERM SIGINT
+
+# Generate food on a random cell.
+generate-food () {
+    # $randCoords stores random order pair: modulo of $RANDOM and respective MAX constant.
+    # This way we can limit the random numbers to the range of possible coordinates.
+    local randCoords="$((${RANDOM}%XMAX)),$((${RANDOM}%YMAX))"
+    
+    # Generate food only if present number of food cells isn't equal to the maximum number.
+    if (( curFood != foodMax )); then
+        # Check if there is space for the maximum of food cells. If there isn't, decrement $foodMax.
+        if (( (((XMAX+1)*(YMAX+1))-score)>=foodMax )); then
+            # Try to generate food next time if there's already an object on the coordinates, else add a food cell to the field and increment $curFood.
+            if [[ (${field[$randCoords]} == "$FOOD") || (${field[$randCoords]} == "$BODY") || (${field[$randCoords]} == "$HEAD") ]]; then
+                return 0
+            else
+                field[$randCoords]="$FOOD"
+                draw-at "${randCoords#*,}" "${randCoords%,*}" "$FOOD"
+                ((curFood++))
+            fi
+        else
+            ((foodMax--))
+        fi
+    fi
+    # Change the score number on the terminal.
+    echo -en "\033[$((1));$(($((XMAX+11))))H"; echo -n "$score"
+}
+
+# Check for various conditions.
+check-coords () {
+    # If head's coordinates point to the field's cell with food, increment snake's length, and decrement $curFood.
+    if [[ "${field[$xcoord,$ycoord]}" == "$FOOD" ]]; then
+        ((score++))
+        ((curFood--))
+    # If score is equal to the area of the field accounting head, echo win message and exit.
+    elif (( (score)==(((XMAX+1)*(YMAX+1))-1) )); then
+        clean-exit 1
+    # If head's coordinates point to the body's cell, echo lose message and exit.
+    elif [[ "${field[$xcoord,$ycoord]}" == "$BODY" ]]; then
+        clean-exit 0
+    # If the head's order pair has a coordinate that is greater than the maximum or less than zero, echo lose message and exit.
+    elif (( (xcoord > XMAX) || (ycoord > YMAX) || (xcoord < 0) || (ycoord < 0) )); then
+        clean-exit 0
+    fi
+}
+
+# Move body. The function has the loop that increments the index of each past move in a queue, and if there's an index greater than score,
+# it will remove the body on that past move to create illusion of movement.
+move-body () {
+    # Draw body cell on a previous ordered pair.
+    field[${moveQueue[0]}]="$BODY"
+    draw-at ${moveQueue[0]#*,} ${moveQueue[0]%,*} "$BODY"
+
+    # The loop iterates $moveQueue from the $i moving each order pair to the next index.
+    for ((i=score; i>=0; i--)); do
+        moveQueue[$((i+1))]="${moveQueue[$i]}"
+    done
+
+    # If index greater than $score exists, delete the body cell on that order pair.
+    if [[ -n "${moveQueue[$((score+1))]}" ]]; then
+        field[${moveQueue[$((score+1))]}]=' '
+        draw-at ${moveQueue[$((score+1))]#*,} ${moveQueue[$((score+1))]%,*} " "
+    fi
+
+    # Draw head on the field. 
+    draw-at $ycoord $xcoord "$HEAD"
+}
+
+# Accepts keys to move snake.
+# For each key algorithm is the same.
+# - Change respective coordinate.
+# - Check coordinates for a specific condition.
+# - Move snake's body.
+move-snake () {
+    case $1 in
+        $RIGHT)
+            ((xcoord++))
+            check-coords
+            move-body
+            ;;
+        $DOWN) 
+            ((ycoord++))
+            check-coords
+            move-body
+            ;;
+        $LEFT) 
+            ((xcoord--))
+            check-coords
+            move-body
+            ;;
+        $UP) 
+            ((ycoord--))
+            check-coords
+            move-body
+            ;;
+    esac
+}
+
+# Draw head at starting position.
+draw-at $ycoord $xcoord "$HEAD"
+
+# The game loop reads one key or timeouts, then adds old previous head's coordinates to $moveQueue array,
+# invokes generate-food function, after which it checks if move has been made. If it is, then it assign the key to $prevMove and invokes move-snake with current key,
+# else it invokes move-snake with $prevMove.
+while read -s -t $TIME -n 1 move || : ; do
+    moveQueue[0]="$xcoord,$ycoord"
+    generate-food
+    if [[ -z "$move" ]]; then
+        move-snake "$prevMove"
+    else
+        prevMove="$move"
+        move-snake "$move"
+    fi
+done
